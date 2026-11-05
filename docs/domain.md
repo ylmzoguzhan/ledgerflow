@@ -1,86 +1,53 @@
-# LedgerFlow — Domain Tasarımı
+# Domain Notları
 
-Bu doküman, Faz 0'da kararlaştırılan bounded context sınırlarını, ödeme yaşam döngüsünü ve çift kayıtlı defter (double-entry ledger) kurallarını tanımlar.
+## Modüller ve Tutarlılık Sınırları
+Sistem tek bir PostgreSQL veritabanı üzerinde modül bazlı şema ayrımıyla çalışır (`identity`, `payments`, `ledger`, `reconciliation`, `payouts`, `notifications`, `fx`, `copilot`). Modüller birbirinin tablosuna doğrudan sorgu atamaz, sadece `.Contracts` projeleri üzerinden haberleşir.
 
----
+İki ana akışta farklı tutarlılık modeli uygulanır:
+- Ödeme onayı (`Payments` -> `Ledger` / `Notifications`): Asenkron çalışır. `Payments` ödemeyi `Captured` yaptığında aynı transaction içinde Outbox tablosuna kayıt bırakır. `Pending` bakiye o saniye çekilemediği için aradaki kısa gecikme sorun yaratmaz.
+- Hakediş çekimi (`Payouts` -> `Ledger` -> `Bank`): Bakiye kontrolü ve blokaj (`Available` -> `Reserved`) bellek içinde senkron yapılır; bakiye yetersizse istek anında reddedilir (`422`). Dış banka EFT çağrısı ise açık transaction tutmamak için blokaj sonrasında Outbox + Worker üzerinden asenkron yürütülür.
 
-## 1. Bounded Context Sınırları ve Tutarlılık Modeli
-
-Tek bir PostgreSQL veritabanı içinde her modül kendi şemasına sahiptir; modüller arası doğrudan tablo `JOIN`'i veya `DbContext` paylaşımı yasaktır (`NetArchTest` ile zorunlu kılınır). Bir modül diğerinin yalnızca `<Module>.Contracts` projesini referans alabilir.
-
-| Modül | DB Şeması | Sorumluluk |
-| --- | --- | --- |
-| `Identity` | `identity` | Kullanıcılar, Merchant (tenant) tanımları, roller, JWT / API Key / Cookie kimlik doğrulama |
-| `Payments` | `payments` | Ödeme yaşam döngüsü, `Idempotency-Key`, PSP entegrasyonu ve gelen PSP webhook'ları |
-| `Ledger` | `ledger` | Çift kayıtlı yevmiye defteri (`append-only`) ve Merchant bakiye hesapları |
-| `Reconciliation` | `reconciliation` | PSP settlement CSV'si + banka ekstresi + iç defter üçlü eşleştirmesi ve uyuşmazlık (`Discrepancy`) yönetimi |
-| `Payouts` | `payouts` | Merchant hakediş çekim talepleri ve banka EFT çıkışları |
-| `Notifications` | `notifications` | Merchant'lara giden imzalı outbound webhook'lar, retry ve DLQ |
-| `FX` | `fx` | Döviz kuru sağlayıcı entegrasyonu, önbellek ve fallback |
-| `AICopilot` | `copilot` | Tenant izolasyonlu RAG, uyuşmazlık analizi, e-posta sınıflandırma ve insan onaylı aksiyon araçları |
-
-### Modüller Arası İletişim Kararı (Hibrit Model)
-- **Capture Akışı (`Payments` → `Ledger`, `Notifications`):** **Asenkron (Outbox + Kuyruk).** Müşteri ödemesi onaylandığında `Payments` kendi tablosunu ve Outbox kaydını yazar; `Ledger` ve `Notifications` olayı kuyruktan tüketir. `Pending` bakiye anında çekilemeyeceği için *eventual consistency* finansal risk oluşturmaz.
-- **Payout Akışı (`Payouts` → `Ledger` → `Bank`):** **Senkron Blokaj + Asenkron EFT.**
-  1. `POST /payouts` anında `Payouts`, `ILedgerModule` sözleşmesi üzerinden **senkron in-process** çağrı ile bakiyeyi kontrol edip bloke eder (`MerchantAvailable` → `MerchantReserved`). Bakiye yetersizse anında `422 Unprocessable Entity` döner; gereksiz Request-Reply Saga karmaşasından kaçınılır.
-  2. Dış `Bank Simulator` EFT çağrısı asla açık bir DB transaction'ı içinde yapılmaz; blokaj sonrası **Outbox + Worker** ile asenkron yürütülür. EFT başarılı olursa `MerchantReserved` kapatılır, başarısız olursa ters kayıtla `MerchantAvailable`'a iade edilir.
-
----
-
-## 2. Ödeme Durum Makinesi (`Payment` State Machine)
+## Ödeme Durum Makinesi
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Created: POST /payments (Idempotency-Key)
+    [*] --> Created: POST /payments
     Created --> Captured: PSP 200 OK
     Created --> Failed: PSP Declined / 4xx
     Created --> Unknown: PSP Timeout / 5xx
     
-    Unknown --> Captured: PSP Webhook (payment.captured) / Sorgu Job'u
-    Unknown --> Failed: PSP Sorgu Job'u (çekim yok teyidi)
+    Unknown --> Captured: Webhook / Sorgu teyidi
+    Unknown --> Failed: Sorgu teyidi (çekim yok)
     
-    Captured --> PartiallyRefunded: Parçalı İade
-    PartiallyRefunded --> PartiallyRefunded: Ek Parçalı İade
-    Captured --> Refunded: Tam İade
-    PartiallyRefunded --> Refunded: Kalan Tutarın İadesi
+    Captured --> PartiallyRefunded: Parçalı iade
+    PartiallyRefunded --> PartiallyRefunded: Ek parçalı iade
+    Captured --> Refunded: Tam iade
+    PartiallyRefunded --> Refunded: Kalan tutarın iadesi
 ```
 
-### Üretim Kuralları (Invariants)
-1. **Timeout ≠ Başarısız:** PSP çağrısında ağ zaman aşımı (`Timeout`) veya `5xx` alındığında durum `Failed` değil **`Unknown`** olur; aksi halde müşteri tekrar dener ve çifte tahsilat (*double charge*) yaşanır.
-2. **Idempotent Webhook İşleme:** Zaten `Captured` olan bir ödemeye tekrar `payment.captured` webhook'u gelirse hata fırlatılmaz; **idempotent no-op** uygulanır (ikinci kez Outbox olayı üretilmez) ve PSP retry fırtınasını önlemek için `200 OK` dönülür.
-3. **Terminal Durumlar (`Failed`, `Refunded`):** `Failed` terminaldir ve kayıt asla silinmez. `Failed` olarak kapanmış bir ödemeye sonradan PSP tahsilat bildirimi (geç webhook veya ertesi gün CSV satırı) gelirse durum sessizce `Captured`'a çevrilmez; `Reconciliation` modülüne **`UnexpectedCaptureDiscrepancy`** fırlatılır ve otomatik iade / operasyon incelemesi tetiklenir.
+Temel kurallar:
+- PSP çağrısında timeout alındığında durum `Failed` değil `Unknown` olur; aksi halde müşteri tekrar deneyip mükerrer çekim yaşayabilir.
+- Zaten `Captured` olan bir ödemeye PSP'den ikinci kez aynı webhook gelirse hata fırlatılmaz, yeni event üretmeden `200 OK` dönülür (idempotent no-op).
+- `Failed` ve `Refunded` son (terminal) durumlardır, kayıt silinmez. `Failed` kalmış bir işleme sonradan PSP tahsilat bildirimi gelirse durum sessizce `Captured` yapılmaz; mutabakat modülüne uyuşmazlık (`UnexpectedCaptureDiscrepancy`) kaydı düşülür.
 
----
+## Çift Kayıtlı Defter (Double-Entry Ledger)
+`ledger.journal_entries` ve `ledger.entries` tabloları append-only çalışır (`UPDATE` / `DELETE` yapılmaz, düzeltmeler ters kayıtla atılır). Her fişte borç ve alacak toplamı eşit olmak zorundadır (`SUM(Debit) == SUM(Credit)`).
 
-## 3. Çift Kayıtlı Defter (`Double-Entry Ledger`) ve Bakiye Modeli
+Kullanılan hesaplar:
+- Varlık hesapları (artışı `Debit`): `PspReceivable`, `BankSettlement`
+- Yükümlülük ve gelir hesapları (artışı `Credit`): `MerchantPending`, `MerchantAvailable`, `MerchantReserved`, `PlatformFeeRevenue`
 
-### Temel İlkeler
-1. **Append-Only:** `ledger.journal_entries` ve `ledger.entries` tablolarında `UPDATE` ve `DELETE` yapılmaz. İptal ve düzeltmeler ters yönlü yeni bir `JournalEntry` ile kaydedilir.
-2. **Sıfır Toplam Kuralı:** Her `JournalEntry` içindeki borç (`Debit`) ve alacak (`Credit`) bacaklarının toplamı birbirine eşit olmak zorundadır (`SUM(Debit) == SUM(Credit)`).
+1.000 TL satış (%2,5 = 25 TL komisyon) örneği:
 
-### Hesap Planı (Chart of Accounts)
-| Hesap | Tür | Artış Yönü | Açıklama |
-| --- | --- | --- | --- |
-| `PspReceivable` | Varlık (Asset) | `Debit` | PSP'den tahsil edilecek brüt alacak |
-| `BankSettlement` | Varlık (Asset) | `Debit` | Şirket banka hesabındaki gerçek nakit |
-| `MerchantPending:{MerchantId}` | Yükümlülük (Liability) | `Credit` | Mutabakat/valör bekleyen bloke üye işyeri bakiyesi |
-| `MerchantAvailable:{MerchantId}` | Yükümlülük (Liability) | `Credit` | Çekilebilir üye işyeri bakiyesi (`CHECK (balance >= 0)`) |
-| `MerchantReserved:{MerchantId}` | Yükümlülük (Liability) | `Credit` | Payout süresince bloke tutulan bakiye |
-| `PlatformFeeRevenue` | Gelir (Revenue) | `Credit` | Platform komisyon geliri |
-
-### Örnek Akış (1.000,00 TRY Satış, %2,5 = 25,00 TRY Komisyon)
-| Olay | `Debit` (Borç) | `Credit` (Alacak) |
+| Aşama | Debit | Credit |
 | --- | --- | --- |
-| **1. Capture** | `PspReceivable` 1.000 | `MerchantPending` 975 + `PlatformFeeRevenue` 25 |
-| **2a. Banka Takası (Settlement)** | `BankSettlement` 1.000 | `PspReceivable` 1.000 |
-| **2b. Mutabakat / Valör Çözümü** | `MerchantPending` 975 | `MerchantAvailable` 975 |
-| **3a. Payout Blokajı (Senkron)** | `MerchantAvailable` 975 | `MerchantReserved` 975 |
-| **3b. Payout EFT Onayı (Asenkron)** | `MerchantReserved` 975 | `BankSettlement` 975 |
-| **İade (Komisyon İadesiz Politika)** | `MerchantAvailable` (veya `Pending`) 1.000 | `PspReceivable` 1.000 |
+| Capture | `PspReceivable` 1.000 | `MerchantPending` 975, `PlatformFeeRevenue` 25 |
+| Banka takası | `BankSettlement` 1.000 | `PspReceivable` 1.000 |
+| Mutabakat / valör çözümü | `MerchantPending` 975 | `MerchantAvailable` 975 |
+| Payout blokajı | `MerchantAvailable` 975 | `MerchantReserved` 975 |
+| Payout EFT onayı | `MerchantReserved` 975 | `BankSettlement` 975 |
+| İade (komisyon iadesiz) | `MerchantAvailable` / `Pending` 1.000 | `PspReceivable` 1.000 |
 
-> **İade Politikası:** Müşteri iadelerinde platform komisyonu (`PlatformFeeRevenue`) üye işyerine iade edilmez; iade tutarının tamamı üye işyeri bakiyesinden karşılanır (`balance >= iade tutarı` kontrolü ile `CHECK (balance >= 0)` korunur).
+İadelerde komisyon iade edilmez, tutarın tamamı üye işyeri bakiyesinden düşülür.
 
-### Performans ve Eşzamanlılık Stratejisi (`SUM` vs. `balance` Kolonu)
-- `ledger.entries` tablosu milyonlarca satıra ulaşacağından her bakiye kontrolünde `SUM(...)` çalıştırılmaz.
-- Gerçek kaynak (`Source of Truth`) `ledger.entries` tablosu kalmak şartıyla, `ledger.accounts` tablosunda güncel `balance` projeksiyon kolonu tutulur.
-- Güncellik kaybını ve *Lost Update* anomalisini önlemek için `ledger.entries` eklemesi ve `ledger.accounts.balance` güncellemesi **aynı PostgreSQL transaction'ı içinde**, atomik satır kilidi / `xmin` versiyon kontrolü ve `CHECK (balance >= 0)` kısıtıyla birlikte yapılır. Gece mutabakat sürecinde `SUM` ile `balance` çapraz doğrulanır (*self-auditing*).
+Milyonlarca satırda her seferinde `SUM` almamak için `ledger.accounts` tablosunda güncel `balance` kolonu tutulur. Tutarsızlık ve lost update olmaması için `entries` satırları ile `accounts.balance` aynı DB transaction'ı içinde (`xmin` / satır kilidi ve `CHECK (balance >= 0)` kısıtıyla) güncellenir.
