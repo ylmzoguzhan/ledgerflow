@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Sdk Name="Aspire.AppHost.Sdk" Version="13.6.4" />
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsAspireHost>true</IsAspireHost>
+    <UserSecretsId>ab60de42-757c-4bd0-a8a3-d8fa23854482</UserSecretsId>
+    <NoWarn>$(NoWarn);ASPIRE010</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" />
+    <PackageReference Include="Aspire.Hosting.PostgreSQL" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LedgerFlow.Api\LedgerFlow.Api.csproj" />
+    <ProjectReference Include="..\LedgerFlow.Simulators\LedgerFlow.Simulators.csproj" />
+  </ItemGroup>
+
+</Project>

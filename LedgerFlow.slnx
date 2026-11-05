@@ -1,0 +1,22 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LedgerFlow.Api/LedgerFlow.Api.csproj" />
+    <Project Path="src/LedgerFlow.AppHost/LedgerFlow.AppHost.csproj" />
+    <Project Path="src/LedgerFlow.ServiceDefaults/LedgerFlow.ServiceDefaults.csproj" />
+    <Project Path="src/LedgerFlow.Simulators/LedgerFlow.Simulators.csproj" />
+  </Folder>
+  <Folder Name="/src/Modules/" />
+  <Folder Name="/src/Modules/Ledger/">
+    <Project Path="src/Modules/Ledger/LedgerFlow.Modules.Ledger.Contracts/LedgerFlow.Modules.Ledger.Contracts.csproj" />
+    <Project Path="src/Modules/Ledger/LedgerFlow.Modules.Ledger/LedgerFlow.Modules.Ledger.csproj" />
+  </Folder>
+  <Folder Name="/src/Modules/Payments/">
+    <Project Path="src/Modules/Payments/LedgerFlow.Modules.Payments.Contracts/LedgerFlow.Modules.Payments.Contracts.csproj" />
+    <Project Path="src/Modules/Payments/LedgerFlow.Modules.Payments/LedgerFlow.Modules.Payments.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LedgerFlow.ArchitectureTests/LedgerFlow.ArchitectureTests.csproj" />
+    <Project Path="tests/LedgerFlow.IntegrationTests/LedgerFlow.IntegrationTests.csproj" />
+    <Project Path="tests/LedgerFlow.UnitTests/LedgerFlow.UnitTests.csproj" />
+  </Folder>
+</Solution>

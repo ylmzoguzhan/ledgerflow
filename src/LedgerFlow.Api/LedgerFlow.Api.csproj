@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LedgerFlow.ServiceDefaults\LedgerFlow.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\Modules\Payments\LedgerFlow.Modules.Payments\LedgerFlow.Modules.Payments.csproj" />
+    <ProjectReference Include="..\Modules\Ledger\LedgerFlow.Modules.Ledger\LedgerFlow.Modules.Ledger.csproj" />
+  </ItemGroup>
+
+</Project>
